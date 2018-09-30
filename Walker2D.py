@@ -5,6 +5,7 @@ from tensorflow.contrib.layers import fully_connected
 from tensorflow.layers import batch_normalization
 import numpy as np
 from collections import deque
+import matplotlib.pyplot as plt
 
 batch_size = 32
 
@@ -24,9 +25,9 @@ class ReplayBuffer:
         
         self.buffer = deque()
         
-    def add(self, s, a, r, s_p):
+    def add(self, s, a, r, s_p, done):
         
-        quad_tuple = (s, a, r, s_p)
+        quad_tuple = (s, a, r, s_p, done)
         
         self.buffer.append(quad_tuple)
         if (len(self.buffer) > self.max):
@@ -81,7 +82,7 @@ class Actor:
         self.params = tf.trainable_variables(scope = scope)
         self.target_params= tf.trainable_variables(scope = target_scope) 
         
-        self.unnormalized_actor_gradients = tf.gradients(self.outputs, self.params, -self.action_gradient)    
+        self.unnormalized_actor_gradients = tf.gradients(self.outputs, self.params, -self.action_gradient[0]) #Further clarification required
         self.actor_gradients = list(map(lambda x: tf.div(x, batch_size), self.unnormalized_actor_gradients))
         self.optimize = tf.train.AdamOptimizer().apply_gradients(zip(self.actor_gradients, self.params))
         
@@ -118,7 +119,9 @@ class Critic:
         self.inputs, self.actions, self.outputs = self.create_network(scope)
         self.target_inputs, self.target_actions, self.target_outputs = self.create_network(target_scope)
         
-        self.predict_q = tf.placeholder(tf.float32, shape = (None))
+        print(self.target_outputs.shape)
+        
+        self.predict_q = tf.placeholder(tf.float32, shape = (None, 1))
         
         self.loss = tf.square(self.predict_q - self.outputs)
         self.update = tf.train.AdamOptimizer().minimize(self.loss)
@@ -127,7 +130,7 @@ class Critic:
         
         self.target_params = tf.trainable_variables(target_scope)
 
-        self.update_target = [self.target_params[i].assign(tf.multiply(self.main_params[i], self.tau) + tf.multiply(self.target_params[i], 1-self.tau))
+        self.update_target_network = [self.target_params[i].assign(tf.multiply(self.main_params[i], self.tau) + tf.multiply(self.target_params[i], 1-self.tau))
                                 for i in range(len(self.main_params))]
         
         self.act_gradient = tf.gradients(self.outputs, self.actions)
@@ -145,7 +148,7 @@ class Critic:
            
            Z = fully_connected(inputs, 128)
            
-           #Z = batch_normalization(Z)
+           Z = batch_normalization(Z)
 
            Z_comb= tf.matmul(Z, w1) + tf.matmul(actions, w2) + b
            Z_comb = tf.nn.relu(Z_comb)
@@ -162,9 +165,9 @@ class Critic:
         
         return self.sess.run(self.predict_q, feed_dict = {self.inputs: state, self.actions: action})
     
-    def train_test(self, state, action, predicted_q):
+    def update_target(self):
         
-        self.sess.run(self.update_target)
+        self.sess.run(self.update_target_network)
     
     def predict_test(self, state, action):
         
@@ -178,7 +181,7 @@ class Critic:
         
         self.sess = sess
     
-def play_one(env, actor, critic, replay_buffer, gamma):
+def play_one(env, actor, critic, replay_buffer, gamma, explore_noise):
     
     gamma = gamma
     
@@ -192,7 +195,7 @@ def play_one(env, actor, critic, replay_buffer, gamma):
         
         state = np.reshape(state, (1,17))
         
-        action = actor.predict(state)
+        action = actor.predict(state) + explore_noise
         
         if action.shape != (1,6):
             
@@ -204,13 +207,14 @@ def play_one(env, actor, critic, replay_buffer, gamma):
         new_state = np.reshape(new_state, (1,17))
 
         total_reward += reward
-        replay_buffer.add(state, action, reward, new_state)
+        replay_buffer.add(state, action, reward, new_state, done)
         new_state = state
         
         state_list = []
         reward_list = []
         statep_list = []
         action_list = []
+        done_list = []
         
         for i in range(batch_size):
             
@@ -218,20 +222,39 @@ def play_one(env, actor, critic, replay_buffer, gamma):
             
             state_list.append(quad_tuple[0])
             reward_list.append(quad_tuple[2])
-            statep_list.append(quad_tuple[-1])
+            statep_list.append(quad_tuple[-2])
             action_list.append(quad_tuple[1])
+            done_list.append(quad_tuple[-1])
             
         action_list = np.squeeze(np.array(action_list))
         state_list = np.squeeze(np.array(state_list))
         statep_list = np.squeeze(np.array(statep_list))
         reward_list = np.array(reward_list)
+        reward_list = np.reshape(reward_list, (32, 1))
+        done_list = np.reshape(done_list, (32, 1))
         
-        target_q = reward_list + critic.predict_test(statep_list, action_list)
-        critic.train(state_list, action_list, target_q)
-        action_gradient = critic.action_gradient(state_list, action_list)
+        target_qs = []
+        
+        for i in range(batch_size):
+            
+            if done_list[i]:
+                
+                target_qs.append(reward_list[i])
+        
+            else:
+                
+                target_qs.append(reward_list[i] + critic.predict_test(np.reshape(statep_list[i], (1,17)), actor.target_predict(np.reshape(statep_list[i], (1,17)))))
+        
+        target_qs = np.reshape(np.array(target_qs), (32,1))
+        
+        critic.train(state_list, action_list, target_qs)
+        action_gradient = critic.action_gradient(state_list, actor.predict(state_list))
         actor.train(state_list, action_gradient[0])
         
         step += 1
+        
+        actor.update_target()
+        critic.update_target()
     
     return total_reward
 
@@ -259,19 +282,22 @@ class OrnsteinUhlenbeckActionNoise: #Copied based on the noise used in OpenAI DD
 
 if __name__ == "__main__": 
     
-    episode = 1000
+    episode = 10000
     min_fill = 100000
     max_fill = 250000
 
     env = gym.make("HalfCheetah-v2")
     
-    gamma = 0.9
+    gamma = 0.99
     
     replay_buffer = ReplayBuffer(min_fill, max_fill)
 
+    avg_reward = []
         
     actor = Actor("normA", "targetA")
     critic = Critic("normC", "targetC")
+    
+    saver = tf.train.Saver()
     
     with tf.Session() as sess:
        
@@ -279,8 +305,9 @@ if __name__ == "__main__":
         
         actor.set_session(sess)
         critic.set_session(sess)
-        
-        saver = tf.train.Saver()
+
+        actor.update_target()
+        critic.update_target()
         
         state = env.reset()
         
@@ -302,7 +329,7 @@ if __name__ == "__main__":
             
             #action = np.squeeze(action)
             
-            replay_buffer.add(state, action, reward, new_state)
+            replay_buffer.add(state, action, reward, new_state, done)
             state = new_state
             
             if done:
@@ -310,20 +337,32 @@ if __name__ == "__main__":
                 state = env.reset()
             
         print("Buffer initialized, starting training")
-            
+        
         reward_trend = []
         
         for i in range(episode):
 
-            total_reward = play_one(env, actor, critic, replay_buffer, gamma)
+            total_reward = play_one(env, actor, critic, replay_buffer, gamma, actor_noise())
             
             reward_trend.append(total_reward)
             
-            print("OneIter ", total_reward)
+            if i % 10 == 0:
+            
+                avg_trend = reward_trend[-10:]
+                
+                print(np.mean(avg_trend), " Last 10 rwd ", i)
             
             if i % 100 == 0:
                 
-                saver.save(sess, "/models/mujo.ckpt")
+                avg_trend = reward_trend[-100:]
+                
+                print(np.mean(avg_trend), " Last 100 rwd")
+                
+                print("Saving ..")
+                
+                saver.save(sess, "./models/mujo.ckpt")
 
+        plt.plot(reward_trend)
         
+        plt.show()
     
