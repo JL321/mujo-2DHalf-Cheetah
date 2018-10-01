@@ -1,4 +1,4 @@
-# mujo-2DWalker
+# mujo-2DHalf-Cheetah
 
 Uses DDPG (Deep Deterministic Policy Gradient) Algorithm for the OpenAI Gym Mujo 2D Walker environment.
 
