@@ -1,4 +1,3 @@
-#from gym.envs.mujoco import walker2d
 import gym
 import tensorflow as tf
 from tensorflow.contrib.layers import fully_connected
